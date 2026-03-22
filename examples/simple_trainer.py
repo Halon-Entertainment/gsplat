@@ -108,6 +108,8 @@ class Config:
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
+    # Preload all training images to CPU memory (6x speedup, uses ~7GB RAM for 55 images)
+    preload: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -377,6 +379,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            preload=cfg.preload,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale

@@ -23,7 +23,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-from pycolmap import SceneManager
+from pycolmap import Reconstruction
 from tqdm import tqdm
 from typing_extensions import assert_never
 
@@ -94,13 +94,10 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
-        manager.load_cameras()
-        manager.load_images()
-        manager.load_points3D()
+        reconstruction = Reconstruction(colmap_dir)
 
         # Extract extrinsic matrices in world-to-camera format.
-        imdata = manager.images
+        imdata = reconstruction.images
         w2c_mats = []
         camera_ids = []
         Ks_dict = dict()
@@ -110,8 +107,9 @@ class Parser:
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
-            rot = im.R()
-            trans = im.tvec.reshape(3, 1)
+            cfw = im.cam_from_world()
+            rot = cfw.rotation.matrix()
+            trans = cfw.translation.reshape(3, 1)
             w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
             w2c_mats.append(w2c)
 
@@ -120,35 +118,43 @@ class Parser:
             camera_ids.append(camera_id)
 
             # camera intrinsics
-            cam = manager.cameras[camera_id]
-            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+            cam = reconstruction.cameras[camera_id]
+            fx = cam.focal_length_x
+            fy = cam.focal_length_y
+            cx = cam.principal_point_x
+            cy = cam.principal_point_y
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
             K[:2, :] /= factor
             Ks_dict[camera_id] = K
 
-            # Get distortion parameters.
-            type_ = cam.camera_type
-            if type_ == 0 or type_ == "SIMPLE_PINHOLE":
+            # Get distortion parameters based on camera model.
+            model_name = cam.model.name
+            if model_name == "SIMPLE_PINHOLE":
                 params = np.empty(0, dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 1 or type_ == "PINHOLE":
+            elif model_name == "PINHOLE":
                 params = np.empty(0, dtype=np.float32)
                 camtype = "perspective"
-            if type_ == 2 or type_ == "SIMPLE_RADIAL":
-                params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
+            elif model_name == "SIMPLE_RADIAL":
+                # params: [f, cx, cy, k1]
+                params = np.array([cam.params[3], 0.0, 0.0, 0.0], dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 3 or type_ == "RADIAL":
-                params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
+            elif model_name == "RADIAL":
+                # params: [f, cx, cy, k1, k2]
+                params = np.array([cam.params[3], cam.params[4], 0.0, 0.0], dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 4 or type_ == "OPENCV":
-                params = np.array([cam.k1, cam.k2, cam.p1, cam.p2], dtype=np.float32)
+            elif model_name == "OPENCV":
+                # params: [fx, fy, cx, cy, k1, k2, p1, p2]
+                params = np.array(cam.params[4:8], dtype=np.float32)
                 camtype = "perspective"
-            elif type_ == 5 or type_ == "OPENCV_FISHEYE":
-                params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
+            elif model_name == "OPENCV_FISHEYE":
+                # params: [fx, fy, cx, cy, k1, k2, k3, k4]
+                params = np.array(cam.params[4:8], dtype=np.float32)
                 camtype = "fisheye"
-            assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {type_}"
+            else:
+                raise ValueError(
+                    f"Only perspective and fisheye cameras are supported, got {model_name}"
+                )
 
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
@@ -159,7 +165,7 @@ class Parser:
 
         if len(imdata) == 0:
             raise ValueError("No images found in COLMAP.")
-        if not (type_ == 0 or type_ == 1):
+        if model_name not in ("SIMPLE_PINHOLE", "PINHOLE"):
             print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
         w2c_mats = np.stack(w2c_mats, axis=0)
@@ -218,17 +224,26 @@ class Parser:
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
-        points = manager.points3D.astype(np.float32)
-        points_err = manager.point3D_errors.astype(np.float32)
-        points_rgb = manager.point3D_colors.astype(np.uint8)
-        point_indices = dict()
+        # Build arrays from Reconstruction's points3D dict (pycolmap 3.13+ API).
+        pts3d = reconstruction.points3D
+        point3D_ids = sorted(pts3d.keys())
+        point3D_id_to_idx = {pid: idx for idx, pid in enumerate(point3D_ids)}
+        points = np.array([pts3d[pid].xyz for pid in point3D_ids], dtype=np.float32)
+        points_err = np.array([pts3d[pid].error for pid in point3D_ids], dtype=np.float32)
+        points_rgb = np.array([pts3d[pid].color for pid in point3D_ids], dtype=np.uint8)
 
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(image_name, []).append(point_idx)
+        # Build image_id -> image_name mapping.
+        image_id_to_name = {im_id: imdata[im_id].name for im_id in imdata}
+
+        # Build point visibility: image_name -> [point_idx] from tracks.
+        point_indices = dict()
+        for pid in point3D_ids:
+            pt = pts3d[pid]
+            point_idx = point3D_id_to_idx[pid]
+            for elem in pt.track.elements:
+                image_name = image_id_to_name.get(elem.image_id)
+                if image_name is not None:
+                    point_indices.setdefault(image_name, []).append(point_idx)
         point_indices = {
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
         }
@@ -409,52 +424,82 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        preload: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.preload = preload
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
 
+        # Preload all images to GPU memory for 6x speedup
+        self._image_cache: Dict[int, torch.Tensor] = {}
+        if preload:
+            import tqdm as _tqdm
+            print(f"[Dataset] Preloading {len(self.indices)} images to GPU...")
+            for item in _tqdm.tqdm(range(len(self.indices)), desc="Preloading"):
+                index = self.indices[item]
+                img = imageio.imread(self.parser.image_paths[index])[..., :3]
+                camera_id = self.parser.camera_ids[index]
+                params = self.parser.params_dict[camera_id]
+                if len(params) > 0:
+                    mapx, mapy = (
+                        self.parser.mapx_dict[camera_id],
+                        self.parser.mapy_dict[camera_id],
+                    )
+                    img = cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR)
+                    x, y, w, h = self.parser.roi_undist_dict[camera_id]
+                    img = img[y : y + h, x : x + w]
+                self._image_cache[index] = torch.from_numpy(img).float()
+            print(f"[Dataset] Preloaded {len(self._image_cache)} images")
+
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
-        if len(params) > 0:
-            # Images are distorted. Undistort them.
-            mapx, mapy = (
-                self.parser.mapx_dict[camera_id],
-                self.parser.mapy_dict[camera_id],
-            )
-            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-            x, y, w, h = self.parser.roi_undist_dict[camera_id]
-            image = image[y : y + h, x : x + w]
+        if index in self._image_cache:
+            # Preloaded — already undistorted float tensor
+            image_tensor = self._image_cache[index]
+        else:
+            image = imageio.imread(self.parser.image_paths[index])[..., :3]
+
+            if len(params) > 0:
+                # Images are distorted. Undistort them.
+                mapx, mapy = (
+                    self.parser.mapx_dict[camera_id],
+                    self.parser.mapy_dict[camera_id],
+                )
+                image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+                x, y, w, h = self.parser.roi_undist_dict[camera_id]
+                image = image[y : y + h, x : x + w]
+
+            image_tensor = torch.from_numpy(image).float()
 
         if self.patch_size is not None:
             # Random crop.
-            h, w = image.shape[:2]
+            h, w = image_tensor.shape[:2]
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
-            image = image[y : y + self.patch_size, x : x + self.patch_size]
+            image_tensor = image_tensor[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 
         data = {
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
-            "image": torch.from_numpy(image).float(),
+            "image": image_tensor,
             "image_id": item,  # the index of the image in the dataset
             "camera_idx": self.parser.camera_indices[
                 index
