@@ -455,8 +455,14 @@ class Dataset:
                     img = cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR)
                     x, y, w, h = self.parser.roi_undist_dict[camera_id]
                     img = img[y : y + h, x : x + w]
-                self._image_cache[index] = torch.from_numpy(img).float()
-            print(f"[Dataset] Preloaded {len(self._image_cache)} images")
+                t = torch.from_numpy(img).float()
+                # Pin memory for fast CPU→GPU transfer, or move to GPU directly
+                if torch.cuda.is_available():
+                    t = t.cuda()
+                self._image_cache[index] = t
+            device = "GPU" if torch.cuda.is_available() else "CPU"
+            cache_mb = sum(t.nelement() * t.element_size() for t in self._image_cache.values()) / 1e6
+            print(f"[Dataset] Preloaded {len(self._image_cache)} images to {device} ({cache_mb:.0f} MB)")
 
     def __len__(self):
         return len(self.indices)

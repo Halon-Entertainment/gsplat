@@ -145,6 +145,8 @@ class Config:
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
+    # Minimum 2D Gaussian size in pixels. Default 0.3 = ~3px floor. Lower = sharper detail.
+    eps2d: float = 0.3
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -621,6 +623,7 @@ class Runner:
             Ks=Ks,  # [C, 3, 3]
             width=width,
             height=height,
+            eps2d=self.cfg.eps2d,
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
@@ -732,13 +735,15 @@ class Runner:
             )
             schedulers.extend(ppisp_schedulers)
 
+        # When preloading to GPU, use num_workers=0 (GPU tensors can't cross process boundaries)
+        num_workers = 0 if cfg.preload else 4
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+            pin_memory=not cfg.preload,
         )
         trainloader_iter = iter(trainloader)
 
