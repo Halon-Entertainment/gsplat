@@ -425,12 +425,14 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         preload: bool = False,
+        mask_dir: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.preload = preload
+        self.mask_dir = mask_dir
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -513,6 +515,27 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+
+        # Load per-image actor mask if mask_dir is provided
+        if self.mask_dir is not None:
+            image_name = self.parser.image_names[index]
+            mask_path = os.path.join(self.mask_dir, image_name)
+            # Try PNG extension if original image has different extension
+            if not os.path.exists(mask_path):
+                mask_path = os.path.splitext(mask_path)[0] + ".png"
+            if os.path.exists(mask_path):
+                mask_img = imageio.imread(mask_path)
+                if mask_img.ndim == 3:
+                    mask_img = mask_img[..., 0]  # take first channel
+                # Resize mask to match image dimensions if needed
+                img_h, img_w = image_tensor.shape[:2]
+                if mask_img.shape[0] != img_h or mask_img.shape[1] != img_w:
+                    mask_img = cv2.resize(
+                        mask_img, (img_w, img_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                actor_mask = torch.from_numpy(mask_img).float() / 255.0  # [H, W]
+                data["actor_mask"] = actor_mask
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]

@@ -49,6 +49,7 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
+from gsplat.profile import timeit, profiler as timeit_profiler
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
@@ -125,8 +126,15 @@ class Config:
     init_opa: float = 0.1
     # Initial scale of GS
     init_scale: float = 1.0
+    # Path to PLY file for initialization (overrides init_type to "ply")
+    init_ply: Optional[str] = None
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Path to per-image actor mask directory for masked loss computation
+    mask_dir: Optional[str] = None
+    # Weight for background opacity penalty (drives background Gaussians transparent)
+    # Set to 0.0 to disable. Recommended: 0.01-0.1
+    bg_opacity_penalty: float = 0.0
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -267,6 +275,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    init_ply_path: Optional[str] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -274,43 +283,125 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "ply":
+        from plyfile import PlyData
+
+        assert init_ply_path is not None, "init_ply_path must be set for init_type='ply'"
+        plydata = PlyData.read(init_ply_path)
+        v = plydata.elements[0]
+        N_total = len(v["x"])
+
+        points = torch.tensor(
+            np.stack([v["x"], v["y"], v["z"]], axis=1), dtype=torch.float32
+        )
+
+        # SH DC coefficients
+        sh0 = torch.tensor(
+            np.stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]], axis=1),
+            dtype=torch.float32,
+        ).unsqueeze(1)  # [N, 1, 3]
+
+        # SH rest coefficients — CRITICAL: channel-grouped order in PLY
+        num_rest = sum(1 for p in v.data.dtype.names if p.startswith("f_rest_"))
+        if num_rest > 0:
+            f_rest = np.stack(
+                [v[f"f_rest_{i}"] for i in range(num_rest)], axis=1
+            )  # [N, 3*K]
+            K = num_rest // 3
+            shN = torch.tensor(f_rest, dtype=torch.float32).reshape(
+                -1, 3, K
+            ).permute(0, 2, 1)  # [N, K, 3]
+        else:
+            shN = torch.empty(N_total, 0, 3)
+
+        scales = torch.tensor(
+            np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=1),
+            dtype=torch.float32,
+        )  # already log-space
+        quats = torch.tensor(
+            np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=1),
+            dtype=torch.float32,
+        )  # already WXYZ
+        opacities = torch.tensor(
+            np.asarray(v["opacity"]), dtype=torch.float32
+        )  # already logit-space
+
+        ply_sh_degree = int(np.sqrt(num_rest // 3 + 1)) - 1
+        print(f"[PLY Init] Loaded {N_total} Gaussians from {init_ply_path}")
+        print(
+            f"[PLY Init] SH degree: {ply_sh_degree}, "
+            f"scales range: [{scales.min():.2f}, {scales.max():.2f}]"
+        )
+        if ply_sh_degree != sh_degree:
+            print(
+                f"[PLY Init] WARNING: PLY SH degree ({ply_sh_degree}) != "
+                f"requested sh_degree ({sh_degree}). Using PLY value."
+            )
+
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        sh0 = sh0[world_rank::world_size]
+        shN = shN[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+
+        N = points.shape[0]
+
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
+
+        if feature_dim is None:
+            params.append(("sh0", torch.nn.Parameter(sh0), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(shN), shN_lr))
+        else:
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(torch.full((N, 3), 0.5))  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or ply")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    if init_type in ("sfm", "random"):
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
 
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        N = points.shape[0]
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-    ]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+        if feature_dim is None:
+            # color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -382,6 +473,7 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
             preload=cfg.preload,
+            mask_dir=cfg.mask_dir,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -408,9 +500,12 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
+        init_type = cfg.init_type
+        if cfg.init_ply is not None:
+            init_type = "ply"
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
-            init_type=cfg.init_type,
+            init_type=init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
@@ -430,6 +525,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            init_ply_path=cfg.init_ply,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -780,6 +876,7 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            actor_masks = data["actor_mask"].to(device) if "actor_mask" in data else None  # [B, H, W]
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
@@ -799,29 +896,30 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
-                frame_idcs=image_ids,
-                camera_idcs=data["camera_idx"].to(device),
-                exposure=exposure,
-            )
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                colors, depths = renders, None
+            with timeit("forward/rasterize"):
+                renders, alphas, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                    masks=masks,
+                    frame_idcs=image_ids,
+                    camera_idcs=data["camera_idx"].to(device),
+                    exposure=exposure,
+                )
+                if renders.shape[-1] == 4:
+                    colors, depths = renders[..., 0:3], renders[..., 3:4]
+                else:
+                    colors, depths = renders, None
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                if cfg.random_bkgd:
+                    bkgd = torch.rand(1, 3, device=device)
+                    colors = colors + bkgd * (1.0 - alphas)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -832,48 +930,72 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
-            if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
-            if cfg.post_processing == "bilateral_grid":
-                post_processing_reg_loss = 10 * total_variation_loss(
-                    self.post_processing_module.grids
-                )
-                loss += post_processing_reg_loss
-            elif cfg.post_processing == "ppisp":
-                post_processing_reg_loss = (
-                    self.post_processing_module.get_regularization_loss()
-                )
-                loss += post_processing_reg_loss
+            with timeit("loss"):
+                if actor_masks is not None:
+                    mask_3d = actor_masks.unsqueeze(-1)  # [B, H, W, 1]
+                    fg_count = actor_masks.sum().clamp(min=1)
+                    # L1: only on foreground pixels
+                    l1loss = (torch.abs(colors - pixels) * mask_3d).sum() / (fg_count * 3)
+                    # SSIM: zero both images in background (Approach D from code review)
+                    colors_ssim = colors * mask_3d
+                    pixels_ssim = pixels * mask_3d
+                    ssimloss = 1.0 - fused_ssim(
+                        colors_ssim.permute(0, 3, 1, 2),
+                        pixels_ssim.permute(0, 3, 1, 2),
+                        padding="valid",
+                    )
+                    loss = (1 - cfg.ssim_lambda) * l1loss + cfg.ssim_lambda * ssimloss
 
-            # regularizations
-            if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
-            if cfg.scale_reg > 0.0:
-                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+                    # Background opacity penalty: drive background Gaussians transparent
+                    if cfg.bg_opacity_penalty > 0.0:
+                        bg_mask = 1.0 - actor_masks.unsqueeze(-1)  # [B, H, W, 1]
+                        bg_alpha_loss = (alphas * bg_mask).mean()
+                        loss = loss + cfg.bg_opacity_penalty * bg_alpha_loss
+                else:
+                    # Original unmasked loss (keep existing behavior)
+                    l1loss = F.l1_loss(colors, pixels)
+                    ssimloss = 1.0 - fused_ssim(
+                        colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                    )
+                    loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+                if cfg.depth_loss:
+                    # query depths from depth map
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                    disp_gt = 1.0 / depths_gt  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
+                if cfg.post_processing == "bilateral_grid":
+                    post_processing_reg_loss = 10 * total_variation_loss(
+                        self.post_processing_module.grids
+                    )
+                    loss += post_processing_reg_loss
+                elif cfg.post_processing == "ppisp":
+                    post_processing_reg_loss = (
+                        self.post_processing_module.get_regularization_loss()
+                    )
+                    loss += post_processing_reg_loss
 
-            loss.backward()
+                # regularizations
+                if cfg.opacity_reg > 0.0:
+                    loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                if cfg.scale_reg > 0.0:
+                    loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+
+            with timeit("backward"):
+                loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1005,45 +1127,47 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
-            for optimizer in self.optimizers.values():
-                if cfg.visible_adam:
-                    optimizer.step(visibility_mask)
-                else:
+            with timeit("optimizer"):
+                for optimizer in self.optimizers.values():
+                    if cfg.visible_adam:
+                        optimizer.step(visibility_mask)
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.pose_optimizers:
                     optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.post_processing_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for scheduler in schedulers:
-                scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.app_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.post_processing_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for scheduler in schedulers:
+                    scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
+            with timeit("strategy"):
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        packed=cfg.packed,
+                    )
+                elif isinstance(self.cfg.strategy, MCMCStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        lr=schedulers[0].get_last_lr()[0],
+                    )
+                else:
+                    assert_never(self.cfg.strategy)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1066,6 +1190,15 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        # Dump TIMEIT profiling results
+        if timeit_profiler:
+            print("\n=== TIMEIT Profiling Results ===")
+            for name, total in sorted(timeit_profiler.items(), key=lambda x: -x[1]):
+                print(f"  {name:30s}  {total:10.3f}s")
+            total_all = sum(timeit_profiler.values())
+            print(f"  {'TOTAL':30s}  {total_all:10.3f}s")
+            print("================================\n")
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
